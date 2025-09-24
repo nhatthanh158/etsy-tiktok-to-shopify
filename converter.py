@@ -35,14 +35,43 @@ def split_list_field(val):
     parts = [p.strip() for p in str(val).split(",") if str(p).strip() != ""]
     return parts
 
-def apply_markup(price, markup_pct: float):
-    if price is None or (isinstance(price, float) and math.isnan(price)):
-        return price
+def parse_price(value):
+    """Parse price that may contain currency symbols or thousand separators."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return np.nan
+    s = str(value).strip()
+    if s == "":
+        return np.nan
+    # extract first numeric token
+    m = re.search(r"[+-]?[0-9][0-9\.,]*", s)
+    if not m:
+        try:
+            return float(s)
+        except Exception:
+            return np.nan
+    token = m.group(0)
+    # heuristic: if token has both '.' and ',', assume '.' is thousand sep if comma appears last
+    if ',' in token and '.' in token:
+        # remove thousand sep
+        if token.rfind(',') > token.rfind('.'):
+            token = token.replace('.', '').replace(',', '.')
+        else:
+            token = token.replace(',', '')
+    else:
+        token = token.replace(',', '')
     try:
-        p = float(price)
+        return float(token)
+    except Exception:
+        return np.nan
+
+def apply_markup(price, markup_pct: float):
+    p = parse_price(price)
+    if p is None or (isinstance(p, float) and math.isnan(p)):
+        return ""
+    try:
         return round(p * (1 + float(markup_pct) / 100.0), 2)
     except Exception:
-        return price
+        return ""
 
 def _finalize(df_rows: list[dict]) -> pd.DataFrame:
     if not df_rows:
@@ -126,13 +155,12 @@ def convert_etsy_to_shopify(file_like, vendor_text: str = "", markup_pct: float 
                     if opt2_name_val:
                         row["Option2 Name"] = opt2_name_val
                         row["Option2 Value"] = "" if v2 is None else v2
-                    rows.append(row)
-                    v_index += 1
+                    rows.append(row); v_index += 1
             for pos, url in enumerate(images[1:], start=2):
                 rows.append({"Handle": handle, "Image Src": url, "Image Position": pos})
     return _finalize(rows)
 
-# ---------- TikTok converter (updated to support 'Product description', missing prices/images) ----------
+# ---------- TikTok converter (robust price detection) ----------
 def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: float = 0.0) -> pd.DataFrame:
     name = getattr(file_like, 'name', '')
     if name and name.lower().endswith('.csv'):
@@ -148,11 +176,17 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
                 return c
         return None
 
-    # The sample has 'Product description' (not 'Description')
     title_col = pick("Product Name", "Title", "Name", "Product Title")
     desc_col = pick("Product description", "Description", "Product Description")
-    # Some TikTok exports may have no price/images/variant columns
+
     price_col = pick("Price", "Sale Price", "Selling Price", "SKU Price", "Unit Price")
+    if price_col is None:
+        # fallback: first column that contains 'price' (case-insensitive)
+        for c in tt.columns:
+            if "price" in c.lower():
+                price_col = c
+                break
+
     sku_col = pick("SKU ID", "Seller SKU", "SKU", "Merchant SKU", "Model Number")
     image_cols = [c for c in tt.columns if str(c).lower().startswith("image") or "Main Image" in c or "Images" in c]
 
@@ -177,7 +211,6 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
         handle = slugify(title) if title else f"tiktok-{key}"
         vendor = vendor_text or ""
 
-        # images (may not exist in this export)
         images = []
         for col in image_cols:
             vals = group[col].dropna().astype(str).unique().tolist()
@@ -192,7 +225,6 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
                 uniq.append(u); seen.add(u)
         images = uniq[:20]
 
-        # variants optional
         has_var = False
         if opt1_value_col and group[opt1_value_col].notna().any():
             has_var = True
@@ -223,7 +255,7 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
                 "Option1 Name": "Title",
                 "Option1 Value": "Default Title",
                 "Variant SKU": str(gsku) if pd.notna(gsku) else "",
-                "Variant Price": apply_markup(gprice, markup_pct),  # may be NaN → left blank
+                "Variant Price": apply_markup(gprice, markup_pct),
             })
             if images:
                 row["Image Src"] = images[0]; row["Image Position"] = 1
