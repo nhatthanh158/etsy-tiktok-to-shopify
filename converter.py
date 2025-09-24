@@ -13,32 +13,15 @@ DEFAULT_FULFILLMENT_SERVICE = "manual"
 DEFAULT_REQUIRES_SHIPPING = True
 DEFAULT_TAXABLE = True
 
-# Minimal Shopify columns
 SHOPIFY_BASE_COLS = [
-    "Handle",
-    "Title",
-    "Body (HTML)",
-    "Vendor",
-    "Published",
-    "Option1 Name",
-    "Option1 Value",
-    "Option2 Name",
-    "Option2 Value",
-    "Variant SKU",
-    "Variant Inventory Tracker",
-    "Variant Inventory Qty",
-    "Variant Inventory Policy",
-    "Variant Fulfillment Service",
-    "Variant Price",
-    "Variant Compare At Price",
-    "Variant Requires Shipping",
-    "Variant Taxable",
-    "Image Src",
-    "Image Position",
-    "Status",
+    "Handle","Title","Body (HTML)","Vendor","Published",
+    "Option1 Name","Option1 Value","Option2 Name","Option2 Value",
+    "Variant SKU","Variant Inventory Tracker","Variant Inventory Qty",
+    "Variant Inventory Policy","Variant Fulfillment Service",
+    "Variant Price","Variant Compare At Price","Variant Requires Shipping","Variant Taxable",
+    "Image Src","Image Position","Status",
 ]
 
-# ---------- helpers ----------
 def slugify(text: str) -> str:
     text = str(text or "").strip().lower()
     text = re.sub(r"[^\w\s-]", "", text)
@@ -75,33 +58,19 @@ def _finalize(df_rows: list[dict]) -> pd.DataFrame:
 # ---------- Etsy converter ----------
 def convert_etsy_to_shopify(file_like, vendor_text: str = "", markup_pct: float = 0.0) -> pd.DataFrame:
     etsy = pd.read_csv(file_like, engine="python")
-
     rows = []
     for idx, r in etsy.iterrows():
         title = r.get("TITLE", "")
         desc = r.get("DESCRIPTION", "")
         price = r.get("PRICE", np.nan)
-        tags = r.get("TAGS", "")
-        materials = r.get("MATERIALS", "")
-
-        # collect images
-        images = []
-        for k in range(1, 21):
-            col = f"IMAGE{k}"
-            if col in etsy.columns and pd.notna(r.get(col)):
-                images.append(str(r.get(col)))
-
-        # variations
+        images = [str(r.get(f"IMAGE{k}")) for k in range(1, 21) if f"IMAGE{k}" in etsy.columns and pd.notna(r.get(f"IMAGE{k}"))]
         opt1_name = r.get("VARIATION 1 NAME", np.nan)
         opt1_values = split_list_field(r.get("VARIATION 1 VALUES", np.nan))
         opt2_name = r.get("VARIATION 2 NAME", np.nan)
         opt2_values = split_list_field(r.get("VARIATION 2 VALUES", np.nan))
         sku_list = split_list_field(r.get("SKU", np.nan))
-
         handle = slugify(title) or f"etsy-{idx+1}"
         vendor = vendor_text or r.get("VENDOR", "") or ""
-
-        # price after markup
         out_price = apply_markup(price, markup_pct)
 
         def base_row():
@@ -128,12 +97,9 @@ def convert_etsy_to_shopify(file_like, vendor_text: str = "", markup_pct: float 
                 "Variant Price": out_price,
             })
             if images:
-                row["Image Src"] = images[0]
-                row["Image Position"] = 1
-            if sku_list:
-                row["Variant SKU"] = sku_list[0]
+                row["Image Src"] = images[0]; row["Image Position"] = 1
+            if sku_list: row["Variant SKU"] = sku_list[0]
             rows.append(row)
-
             for pos, url in enumerate(images[1:], start=2):
                 rows.append({"Handle": handle, "Image Src": url, "Image Position": pos})
         else:
@@ -141,25 +107,16 @@ def convert_etsy_to_shopify(file_like, vendor_text: str = "", markup_pct: float 
             opt2_name_val = str(opt2_name) if pd.notna(opt2_name) and str(opt2_name).strip() else ""
             opt1_vals = opt1_values if opt1_values else ["Default"]
             opt2_vals = opt2_values if opt2_values else [None]
-
             variant_count = len(opt1_vals) * len(opt2_vals)
             def sku_for(i):
-                if sku_list and len(sku_list) == variant_count:
-                    return sku_list[i]
-                return ""
-
+                return sku_list[i] if sku_list and len(sku_list) == variant_count else ""
             v_index = 0
             for v1 in opt1_vals:
                 for v2 in opt2_vals:
                     row = base_row()
                     if v_index == 0:
-                        row.update({
-                            "Title": title,
-                            "Body (HTML)": desc,
-                        })
-                        if images:
-                            row["Image Src"] = images[0]
-                            row["Image Position"] = 1
+                        row.update({"Title": title, "Body (HTML)": desc})
+                        if images: row["Image Src"] = images[0]; row["Image Position"] = 1
                     row.update({
                         "Option1 Name": opt1_name_val,
                         "Option1 Value": v1,
@@ -173,10 +130,9 @@ def convert_etsy_to_shopify(file_like, vendor_text: str = "", markup_pct: float 
                     v_index += 1
             for pos, url in enumerate(images[1:], start=2):
                 rows.append({"Handle": handle, "Image Src": url, "Image Position": pos})
-
     return _finalize(rows)
 
-# ---------- TikTok converter ----------
+# ---------- TikTok converter (updated to support 'Product description', missing prices/images) ----------
 def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: float = 0.0) -> pd.DataFrame:
     name = getattr(file_like, 'name', '')
     if name and name.lower().endswith('.csv'):
@@ -192,8 +148,10 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
                 return c
         return None
 
+    # The sample has 'Product description' (not 'Description')
     title_col = pick("Product Name", "Title", "Name", "Product Title")
-    desc_col = pick("Description", "Product Description")
+    desc_col = pick("Product description", "Description", "Product Description")
+    # Some TikTok exports may have no price/images/variant columns
     price_col = pick("Price", "Sale Price", "Selling Price", "SKU Price", "Unit Price")
     sku_col = pick("SKU ID", "Seller SKU", "SKU", "Merchant SKU", "Model Number")
     image_cols = [c for c in tt.columns if str(c).lower().startswith("image") or "Main Image" in c or "Images" in c]
@@ -219,6 +177,7 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
         handle = slugify(title) if title else f"tiktok-{key}"
         vendor = vendor_text or ""
 
+        # images (may not exist in this export)
         images = []
         for col in image_cols:
             vals = group[col].dropna().astype(str).unique().tolist()
@@ -233,6 +192,7 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
                 uniq.append(u); seen.add(u)
         images = uniq[:20]
 
+        # variants optional
         has_var = False
         if opt1_value_col and group[opt1_value_col].notna().any():
             has_var = True
@@ -263,11 +223,10 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
                 "Option1 Name": "Title",
                 "Option1 Value": "Default Title",
                 "Variant SKU": str(gsku) if pd.notna(gsku) else "",
-                "Variant Price": apply_markup(gprice, markup_pct),
+                "Variant Price": apply_markup(gprice, markup_pct),  # may be NaN → left blank
             })
             if images:
-                row["Image Src"] = images[0]
-                row["Image Position"] = 1
+                row["Image Src"] = images[0]; row["Image Position"] = 1
             rows.append(row)
             for pos, url in enumerate(images[1:], start=2):
                 rows.append({"Handle": handle, "Image Src": url, "Image Position": pos})
@@ -283,13 +242,8 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
 
                 row = base_row()
                 if v_index == 0:
-                    row.update({
-                        "Title": title,
-                        "Body (HTML)": desc,
-                    })
-                    if images:
-                        row["Image Src"] = images[0]
-                        row["Image Position"] = 1
+                    row.update({"Title": title, "Body (HTML)": desc})
+                    if images: row["Image Src"] = images[0]; row["Image Position"] = 1
                 row.update({
                     "Option1 Name": str(v1_name) if pd.notna(v1_name) else "Option1",
                     "Option1 Value": str(v1_value) if pd.notna(v1_value) else "Default",
@@ -299,9 +253,7 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
                 if pd.notna(v2_name) and str(v2_name).strip():
                     row["Option2 Name"] = str(v2_name)
                     row["Option2 Value"] = str(v2_value) if pd.notna(v2_value) else ""
-                rows.append(row)
-                v_index += 1
+                rows.append(row); v_index += 1
             for pos, url in enumerate(images[1:], start=2):
                 rows.append({"Handle": handle, "Image Src": url, "Image Position": pos})
-
     return _finalize(rows)
