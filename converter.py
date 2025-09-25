@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pandas as pd
 import re
-from typing import List, Dict, Any, Iterable
+from typing import List, Dict, Any
 
 # ===== Shopify default config (khớp UI trong app.py) =====
 DEFAULT_PUBLISHED = False
@@ -24,8 +24,8 @@ SHOPIFY_BASE_COLS = [
     "Image Src","Image Position","Status",
 ]
 
-# Bỏ hẳn các option này (không phân biệt hoa/thường)
-EXCLUDE_OPTIONS = {"digital download"}
+# Các option vẫn GIỮ LẠI nhưng **KHÔNG GÁN SKU**
+NO_SKU_OPTIONS = {"digital download", "png"}
 
 # ================= Helpers =================
 def slugify(text: str) -> str:
@@ -86,11 +86,12 @@ def _finalize(df_rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return df[ordered]
 
 # ====== Token matcher (để gán đúng SKU cho Option1) ======
-# Nhận biết: 6M, 12M, 2T, 3T, XS/S/M/L/XL..., 11x14/8x12...
+# Nhận biết: 6M/12M/2T/3T, XS/S/M/L/XL..., 11x14/8x12..., và A-series (A0..A10)
 TOKEN_PATTERNS = [
-    r"\b\d{1,2}\s*[tTmM]\b",
-    r"\b(?:XS|S|M|L|XL|XXL|3XL|4XL)\b",
-    r"\b\d{1,2}\s*[x×]\s*\d{1,2}\b",
+    r"\b\d{1,2}\s*[tTmM]\b",                  # 6M, 12M, 2T, 3T
+    r"\b(?:XS|S|M|L|XL|XXL|3XL|4XL)\b",       # size chữ
+    r"\b\d{1,2}\s*[x×]\s*\d{1,2}\b",         # 11x14, 8x12
+    r"\bA\s*\d{1,2}\b",                       # A0..A10 (A3, A4, ...)
 ]
 TOKEN_RE = re.compile("|".join(TOKEN_PATTERNS), re.I)
 
@@ -98,30 +99,28 @@ def option1_token(val: str) -> str:
     s = str(val or "").upper().strip()
     m = TOKEN_RE.search(s)
     if m:
-        return m.group(0).replace(" ", "").replace("×", "X")
+        tok = m.group(0).replace("×", "X")
+        tok = re.sub(r"\s+", "", tok)  # "A 3" -> "A3"
+        return tok
     parts = re.findall(r"[A-Z0-9]+", s)
     return parts[-1] if parts else s
 
 def sku_token(sku: str) -> str:
     s = str(sku or "").upper()
-    if "_" in s:
-        tail = s.split("_")[-1]
-        m = TOKEN_RE.search(tail)
-        if m:
-            return m.group(0).replace(" ", "").replace("×", "X")
-        return tail
-    m = TOKEN_RE.search(s)
+    tail = s.split("_")[-1] if "_" in s else s
+    m = TOKEN_RE.search(tail)
     if m:
-        return m.group(0).replace(" ", "").replace("×", "X")
-    parts = re.findall(r"[A-Z0-9]+", s)
-    return parts[-1] if parts else s
+        tok = m.group(0).replace("×", "X")
+        return re.sub(r"\s+", "", tok)
+    parts = re.findall(r"[A-Z0-9]+", tail)
+    return parts[-1] if parts else tail
 
 # ================= Etsy → Shopify =================
 def convert_etsy_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct: float = 0.0) -> pd.DataFrame:
     """Etsy CSV:
-    - Bỏ 'Digital Download' trên mọi trục
-    - SKU chỉ map theo Variation 1 (Option1) và replicate sang mọi Option2
-    - Match SKU theo token (6M/12M/2T/3T, 11x14...) nếu thứ tự lệch
+    - GIỮ lại các biến thể 'Digital Download' / 'PNG' nhưng để SKU = trống
+    - SKU map theo Variation 1 (Option1) và replicate sang mọi Option2
+    - Match SKU theo token (6M/12M/2T/3T, 11x14, A3/A4/...) nếu thứ tự lệch
     """
     etsy = pd.read_csv(file_like_or_path, engine="python")
     rows: List[Dict[str, Any]] = []
@@ -151,27 +150,25 @@ def convert_etsy_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct
         opt2_all  = split_list_field(r.get("VARIATION 2 VALUES"))
         skus_all  = split_list_field(r.get("SKU"))
 
-        # Lọc EXCLUDE_OPTIONS
-        def keep(v): return str(v).strip().lower() not in EXCLUDE_OPTIONS
-        opt1 = [v for v in opt1_all if keep(v)] or ["Default"]
-        opt2 = [v for v in opt2_all if keep(v)]
-        have_opt2 = len(opt2) > 0
-        if len(opt1) == 0:
-            continue
+        # Nếu không có Option1 => tạo Default Title (Shopify format)
+        if not opt1_all:
+            opt1_all = ["Default Title"]
 
-        # Map SKU theo Option1
-        # 1) Nếu số SKU == số Option1 gốc => filter bằng cùng mask
-        keep_mask1 = [keep(v) for v in opt1_all] if opt1_all else []
-        if opt1_all and len(skus_all) == len(opt1_all):
-            skus_by_pos = [s for s, k in zip(skus_all, keep_mask1) if k]
-        else:
-            skus_by_pos = skus_all[:len(opt1)]
+        # ===== Map SKU theo Option1 (không loại Digital/PNG) =====
+        # (1) Nếu số SKU == số Option1 gốc => dùng mapping theo vị trí trước
+        skus_by_pos = skus_all[:len(opt1_all)]
+        if len(skus_all) == len(opt1_all):
+            skus_by_pos = list(skus_all)
 
-        # 2) Token-based matching (ưu tiên)
+        # (2) Token-based matching ưu tiên
         token_to_sku = {sku_token(s): s for s in skus_all}
         matched_skus: List[str] = []
         used = set()
-        for i, o1 in enumerate(opt1):
+        for i, o1 in enumerate(opt1_all):
+            if o1.strip().lower() in NO_SKU_OPTIONS:
+                matched_skus.append("")  # will force empty SKU
+                continue
+
             tok = option1_token(o1)
             sku = token_to_sku.get(tok)
             if sku is None:
@@ -180,13 +177,20 @@ def convert_etsy_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct
                 for tk, val in token_to_sku.items():
                     if tk in tok or tok in tk:
                         if val not in used:
-                            found = val; break
+                            found = val
+                            break
                 sku = found
+            if sku is None and skus_by_pos:
+                # fallback vị trí: lấy SKU đầu tiên chưa dùng
+                for s in skus_by_pos:
+                    if s not in used:
+                        sku = s
+                        break
             if sku is None:
-                # fallback vị trí
-                sku = next((s for s in skus_by_pos if s not in used), "")
+                sku = f"ETSY-{slugify(title)}-{i+1:02d}"
+
             used.add(sku)
-            matched_skus.append(sku or f"ETSY-{slugify(title)}-{i+1:02d}")
+            matched_skus.append(sku)
 
         handle = slugify(title) or f"etsy-{idx+1}"
         vendor = vendor_text or r.get("VENDOR", "") or ""
@@ -207,9 +211,16 @@ def convert_etsy_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct
             }
 
         v_idx = 0
-        for i, (o1, o1_sku) in enumerate(zip(opt1, matched_skus)):
+        have_opt2 = len(opt2_all) > 0
+        for i, (o1, o1_sku) in enumerate(zip(opt1_all, matched_skus)):
+            # Nếu o1 thuộc nhóm NO_SKU_OPTIONS thì để SKU = trống
+            if o1.strip().lower() in NO_SKU_OPTIONS:
+                final_sku = ""
+            else:
+                final_sku = str(o1_sku)
+
             if have_opt2:
-                for o2 in opt2:
+                for o2 in opt2_all:
                     row = base_row()
                     if v_idx == 0:
                         row.update({"Title": title, "Body (HTML)": desc})
@@ -220,7 +231,7 @@ def convert_etsy_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct
                         "Option1 Value": str(o1),
                         "Option2 Name": str(opt2_name) if opt2_name else "",
                         "Option2 Value": str(o2) if opt2_name else "",
-                        "Variant SKU": str(o1_sku),
+                        "Variant SKU": final_sku,
                         "Variant Price": out_price,
                     })
                     rows.append(row); v_idx += 1
@@ -233,7 +244,7 @@ def convert_etsy_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct
                 row.update({
                     "Option1 Name": str(opt1_name),
                     "Option1 Value": str(o1),
-                    "Variant SKU": str(o1_sku),
+                    "Variant SKU": final_sku,
                     "Variant Price": out_price,
                 })
                 rows.append(row); v_idx += 1
@@ -253,7 +264,6 @@ def convert_tiktok_to_shopify(file_like_or_path, vendor_text: str = "", markup_p
     elif name and name.lower().endswith(('.xlsx', '.xls')):
         tt = pd.read_excel(file_like_or_path)
     else:
-        # nếu truyền đường dẫn
         p = str(file_like_or_path).lower()
         if p.endswith('.csv'):
             tt = pd.read_csv(file_like_or_path)
@@ -298,7 +308,6 @@ def convert_tiktok_to_shopify(file_like_or_path, vendor_text: str = "", markup_p
         handle = slugify(title) if title else f"tiktok-{key}"
         vendor = vendor_text or ""
 
-        # Ảnh
         images: List[str] = []
         for col in image_cols:
             vals = g[col].dropna().astype(str).unique().tolist()
@@ -307,7 +316,6 @@ def convert_tiktok_to_shopify(file_like_or_path, vendor_text: str = "", markup_p
                 for pth in parts:
                     if pth and pth.startswith("http"):
                         images.append(pth)
-        # unique & limit
         seen = set(); uniq = []
         for u in images:
             if u not in seen:
