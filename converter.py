@@ -2,14 +2,14 @@
 import math
 import numpy as np
 import pandas as pd
-import re
-from typing import List, Dict, Any, Iterable
+import re, html
+from typing import List, Dict, Any
 
-# ===== Shopify default config (khớp UI trong app.py) =====
+# ===== Shopify defaults =====
 DEFAULT_PUBLISHED = False
 DEFAULT_STATUS = "draft"
 DEFAULT_INVENTORY_TRACKER = "shopify"
-DEFAULT_INVENTORY_QTY = ""   # để trống
+DEFAULT_INVENTORY_QTY = ""
 DEFAULT_INVENTORY_POLICY = "continue"
 DEFAULT_FULFILLMENT_SERVICE = "manual"
 DEFAULT_REQUIRES_SHIPPING = True
@@ -24,34 +24,34 @@ SHOPIFY_BASE_COLS = [
     "Image Src","Image Position","Status",
 ]
 
-# Bỏ hẳn các option này (không phân biệt hoa/thường)
-EXCLUDE_OPTIONS = {"digital download"}
+# 1) Những option KHÔNG cần SKU nhưng vẫn giữ lại biến thể
+NO_SKU_OPTIONS = {"digital download", "png"}
 
-# ================= Helpers =================
+# (Giữ lại mọi option; không loại bỏ nữa)
+
+# =============== Helpers ===============
 def slugify(text: str) -> str:
-    text = str(text or "").strip().lower()
+    text = html.unescape(str(text or ""))
+    text = text.strip().lower()
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_-]+", "-", text)
     text = re.sub(r"^-+|-+$", "", text)
     return text[:100]
 
 def split_list_field(val) -> List[str]:
-    if pd.isna(val):
-        return []
-    return [s.strip() for s in str(val).split(",") if str(s).strip()]
+    if pd.isna(val): return []
+    items = [html.unescape(str(x).strip()) for x in str(val).split(",")]
+    return [x for x in items if x]
 
 def parse_price(value):
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return np.nan
     s = str(value).strip()
-    if s == "":
-        return np.nan
+    if s == "": return np.nan
     m = re.search(r"[+-]?[0-9][0-9\.,]*", s)
     if not m:
-        try:
-            return float(s)
-        except Exception:
-            return np.nan
+        try: return float(s)
+        except Exception: return np.nan
     token = m.group(0)
     if ',' in token and '.' in token:
         if token.rfind(',') > token.rfind('.'):
@@ -60,19 +60,14 @@ def parse_price(value):
             token = token.replace(',', '')
     else:
         token = token.replace(',', '')
-    try:
-        return float(token)
-    except Exception:
-        return np.nan
+    try: return float(token)
+    except Exception: return np.nan
 
 def apply_markup(price, markup_pct: float):
     p = parse_price(price)
-    if p is None or (isinstance(p, float) and math.isnan(p)):
-        return ""
-    try:
-        return round(p * (1 + float(markup_pct) / 100.0), 2)
-    except Exception:
-        return ""
+    if p is None or (isinstance(p, float) and math.isnan(p)): return ""
+    try: return round(p * (1 + float(markup_pct) / 100.0), 2)
+    except Exception: return ""
 
 def _finalize(df_rows: List[Dict[str, Any]]) -> pd.DataFrame:
     if not df_rows:
@@ -81,112 +76,104 @@ def _finalize(df_rows: List[Dict[str, Any]]) -> pd.DataFrame:
     ordered = [*SHOPIFY_BASE_COLS, *[k for k in all_keys if k not in SHOPIFY_BASE_COLS]]
     df = pd.DataFrame(df_rows)
     for k in ordered:
-        if k not in df.columns:
-            df[k] = ""
+        if k not in df.columns: df[k] = ""
     return df[ordered]
 
-# ====== Token matcher (để gán đúng SKU cho Option1) ======
-# Nhận biết: 6M, 12M, 2T, 3T, XS/S/M/L/XL..., 11x14/8x12...
+# ====== Token matcher (gán SKU theo Option1) ======
 TOKEN_PATTERNS = [
-    r"\b\d{1,2}\s*[tTmM]\b",
-    r"\b(?:XS|S|M|L|XL|XXL|3XL|4XL)\b",
-    r"\b\d{1,2}\s*[x×]\s*\d{1,2}\b",
+    r"\b\d{1,2}\s*[tTmM]\b",                 # 6M, 12M, 2T, 3T
+    r"\b(?:XS|S|M|L|XL|XXL|3XL|4XL)\b",       # size chữ
+    r"\b\d{1,2}\s*[x×]\s*\d{1,2}\b",         # 11x14, 8x12
 ]
 TOKEN_RE = re.compile("|".join(TOKEN_PATTERNS), re.I)
 
 def option1_token(val: str) -> str:
-    s = str(val or "").upper().strip()
+    s = html.unescape(str(val or "")).upper().strip()
     m = TOKEN_RE.search(s)
-    if m:
-        return m.group(0).replace(" ", "").replace("×", "X")
+    if m: return m.group(0).replace(" ", "").replace("×", "X")
     parts = re.findall(r"[A-Z0-9]+", s)
     return parts[-1] if parts else s
 
 def sku_token(sku: str) -> str:
-    s = str(sku or "").upper()
+    s = html.unescape(str(sku or "")).upper()
     if "_" in s:
         tail = s.split("_")[-1]
         m = TOKEN_RE.search(tail)
-        if m:
-            return m.group(0).replace(" ", "").replace("×", "X")
+        if m: return m.group(0).replace(" ", "").replace("×", "X")
         return tail
     m = TOKEN_RE.search(s)
-    if m:
-        return m.group(0).replace(" ", "").replace("×", "X")
+    if m: return m.group(0).replace(" ", "").replace("×", "X")
     parts = re.findall(r"[A-Z0-9]+", s)
     return parts[-1] if parts else s
 
-# ================= Etsy → Shopify =================
+def _collect_images(row: pd.Series, all_cols: List[str]) -> List[str]:
+    urls = []
+    # ưu tiên IMAGE1..IMAGE20
+    img_cols = [c for c in all_cols if re.fullmatch(r"IMAGE\d{1,2}", str(c).upper())]
+    if not img_cols:
+        img_cols = [c for c in all_cols if "IMAGE" in str(c).upper()]
+    for c in img_cols:
+        v = row.get(c)
+        if pd.notna(v) and str(v).strip():
+            urls.append(str(v).strip())
+    # unique + limit 20
+    seen, uniq = set(), []
+    for u in urls:
+        if u not in seen:
+            uniq.append(u); seen.add(u)
+    return uniq[:20]
+
+# =============== Etsy → Shopify ===============
 def convert_etsy_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct: float = 0.0) -> pd.DataFrame:
-    """Etsy CSV:
-    - Bỏ 'Digital Download' trên mọi trục
-    - SKU chỉ map theo Variation 1 (Option1) và replicate sang mọi Option2
-    - Match SKU theo token (6M/12M/2T/3T, 11x14...) nếu thứ tự lệch
+    """Giữ Digital Download/PNG như biến thể bình thường nhưng để SKU = trống.
+       SKU map theo Option1; replicate qua Option2.
     """
     etsy = pd.read_csv(file_like_or_path, engine="python")
     rows: List[Dict[str, Any]] = []
 
-    # Tiện ích lấy tối đa 20 ảnh IMAGE1..IMAGE20 (nếu có)
-    image_cols = [c for c in etsy.columns if re.fullmatch(r"IMAGE\d{1,2}", str(c).upper())]
-    if not image_cols:
-        image_cols = [c for c in etsy.columns if "IMAGE" in str(c).upper()]
+    all_cols = list(etsy.columns)
 
     for idx, r in etsy.iterrows():
-        title = r.get("TITLE", "")
-        desc = r.get("DESCRIPTION", "")
+        title = html.unescape(r.get("TITLE", ""))
+        desc = html.unescape(r.get("DESCRIPTION", ""))
         price = r.get("PRICE", "")
 
-        # Ảnh
-        images = []
-        for c in image_cols:
-            v = r.get(c)
-            if pd.notna(v) and str(v).strip():
-                images.append(str(v).strip())
-        images = images[:20]
+        images = _collect_images(r, all_cols)
 
-        # Option names/values
         opt1_name = r.get("VARIATION 1 NAME") or r.get("VARIATION 1 TYPE") or "Option1"
         opt2_name = r.get("VARIATION 2 NAME") or r.get("VARIATION 2 TYPE") or ""
         opt1_all  = split_list_field(r.get("VARIATION 1 VALUES"))
         opt2_all  = split_list_field(r.get("VARIATION 2 VALUES"))
         skus_all  = split_list_field(r.get("SKU"))
 
-        # Lọc EXCLUDE_OPTIONS
-        def keep(v): return str(v).strip().lower() not in EXCLUDE_OPTIONS
-        opt1 = [v for v in opt1_all if keep(v)] or ["Default"]
-        opt2 = [v for v in opt2_all if keep(v)]
-        have_opt2 = len(opt2) > 0
-        if len(opt1) == 0:
-            continue
+        # Nếu không có Option1 => tạo Default Title
+        if not opt1_all: opt1_all = ["Default Title"]
 
-        # Map SKU theo Option1
-        # 1) Nếu số SKU == số Option1 gốc => filter bằng cùng mask
-        keep_mask1 = [keep(v) for v in opt1_all] if opt1_all else []
-        if opt1_all and len(skus_all) == len(opt1_all):
-            skus_by_pos = [s for s, k in zip(skus_all, keep_mask1) if k]
-        else:
-            skus_by_pos = skus_all[:len(opt1)]
-
-        # 2) Token-based matching (ưu tiên)
+        # 1) Map SKU cho các Option1 KHÔNG thuộc NO_SKU_OPTIONS
         token_to_sku = {sku_token(s): s for s in skus_all}
-        matched_skus: List[str] = []
-        used = set()
-        for i, o1 in enumerate(opt1):
-            tok = option1_token(o1)
-            sku = token_to_sku.get(tok)
-            if sku is None:
-                # relaxed contains both ways
-                found = None
+        opt1_sku_map: Dict[str, str] = {}
+
+        # dùng mask vị trí nếu count khớp
+        if len(skus_all) == len(opt1_all):
+            for o, s in zip(opt1_all, skus_all):
+                opt1_sku_map[o] = s
+
+        # token matching ưu tiên
+        for o in opt1_all:
+            if o in opt1_sku_map:  # đã có từ vị trí
+                continue
+            tok = option1_token(o)
+            s = token_to_sku.get(tok)
+            if s is None:
+                # relaxed contains
                 for tk, val in token_to_sku.items():
                     if tk in tok or tok in tk:
-                        if val not in used:
-                            found = val; break
-                sku = found
-            if sku is None:
-                # fallback vị trí
-                sku = next((s for s in skus_by_pos if s not in used), "")
-            used.add(sku)
-            matched_skus.append(sku or f"ETSY-{slugify(title)}-{i+1:02d}")
+                        s = val; break
+            opt1_sku_map[o] = s or ""
+
+        # 2) Với các Option1 thuộc NO_SKU_OPTIONS => SKU = "" (trống)
+        def is_no_sku(o: str) -> bool:
+            return o.strip().lower() in NO_SKU_OPTIONS
 
         handle = slugify(title) or f"etsy-{idx+1}"
         vendor = vendor_text or r.get("VENDOR", "") or ""
@@ -207,20 +194,21 @@ def convert_etsy_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct
             }
 
         v_idx = 0
-        for i, (o1, o1_sku) in enumerate(zip(opt1, matched_skus)):
-            if have_opt2:
-                for o2 in opt2:
+        for o1 in opt1_all:
+            sku_for_o1 = "" if is_no_sku(o1) else (opt1_sku_map.get(o1) or f"ETSY-{slugify(title)}-{opt1_all.index(o1)+1:02d}")
+            if opt2_name and opt2_all:
+                for o2 in opt2_all:
                     row = base_row()
                     if v_idx == 0:
                         row.update({"Title": title, "Body (HTML)": desc})
                         if images:
                             row["Image Src"] = images[0]; row["Image Position"] = 1
                     row.update({
-                        "Option1 Name": str(opt1_name),
-                        "Option1 Value": str(o1),
-                        "Option2 Name": str(opt2_name) if opt2_name else "",
-                        "Option2 Value": str(o2) if opt2_name else "",
-                        "Variant SKU": str(o1_sku),
+                        "Option1 Name": html.unescape(str(opt1_name)),
+                        "Option1 Value": html.unescape(str(o1)),
+                        "Option2 Name": html.unescape(str(opt2_name)),
+                        "Option2 Value": html.unescape(str(o2)),
+                        "Variant SKU": "" if is_no_sku(o1) else str(sku_for_o1),
                         "Variant Price": out_price,
                     })
                     rows.append(row); v_idx += 1
@@ -231,41 +219,35 @@ def convert_etsy_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct
                     if images:
                         row["Image Src"] = images[0]; row["Image Position"] = 1
                 row.update({
-                    "Option1 Name": str(opt1_name),
-                    "Option1 Value": str(o1),
-                    "Variant SKU": str(o1_sku),
+                    "Option1 Name": html.unescape(str(opt1_name)),
+                    "Option1 Value": html.unescape(str(o1)),
+                    "Variant SKU": "" if is_no_sku(o1) else str(sku_for_o1),
                     "Variant Price": out_price,
                 })
                 rows.append(row); v_idx += 1
 
-        # Ảnh bổ sung
+        # ảnh bổ sung
         for pos, url in enumerate(images[1:], start=2):
             rows.append({"Handle": handle, "Image Src": url, "Image Position": pos})
 
     return _finalize(rows)
 
-# ================= TikTok → Shopify =================
+# =============== TikTok → Shopify (giữ đơn giản) ===============
 def convert_tiktok_to_shopify(file_like_or_path, vendor_text: str = "", markup_pct: float = 0.0) -> pd.DataFrame:
-    """Đọc CSV hoặc XLSX TikTok; gom ảnh; sinh rows chuẩn Shopify."""
     name = getattr(file_like_or_path, 'name', '')
     if name and name.lower().endswith('.csv'):
         tt = pd.read_csv(file_like_or_path)
     elif name and name.lower().endswith(('.xlsx', '.xls')):
         tt = pd.read_excel(file_like_or_path)
     else:
-        # nếu truyền đường dẫn
         p = str(file_like_or_path).lower()
-        if p.endswith('.csv'):
-            tt = pd.read_csv(file_like_or_path)
-        else:
-            tt = pd.read_excel(file_like_or_path)
+        tt = pd.read_csv(file_like_or_path) if p.endswith('.csv') else pd.read_excel(file_like_or_path)
 
     tt.columns = [str(c).strip() for c in tt.columns]
 
     def pick(*cands):
         for c in cands:
-            if c in tt.columns:
-                return c
+            if c in tt.columns: return c
         return None
 
     title_col = pick("Product Name", "Title", "Name", "Product Title")
@@ -307,7 +289,6 @@ def convert_tiktok_to_shopify(file_like_or_path, vendor_text: str = "", markup_p
                 for pth in parts:
                     if pth and pth.startswith("http"):
                         images.append(pth)
-        # unique & limit
         seen = set(); uniq = []
         for u in images:
             if u not in seen:
@@ -315,10 +296,8 @@ def convert_tiktok_to_shopify(file_like_or_path, vendor_text: str = "", markup_p
         images = uniq[:20]
 
         has_var = False
-        if opt1_value_col and g[opt1_value_col].notna().any():
-            has_var = True
-        if opt2_value_col and g[opt2_value_col].notna().any():
-            has_var = True
+        if opt1_value_col and g[opt1_value_col].notna().any(): has_var = True
+        if opt2_value_col and g[opt2_value_col].notna().any(): has_var = True
 
         def base_row():
             return {
