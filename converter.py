@@ -4,11 +4,11 @@ import numpy as np
 import pandas as pd
 import re
 
-# ===== Shopify default config per user's request =====
+# ===== Shopify default config =====
 DEFAULT_PUBLISHED = False
 DEFAULT_STATUS = "draft"
 DEFAULT_INVENTORY_TRACKER = "shopify"
-DEFAULT_INVENTORY_QTY = ""   # keep blank
+DEFAULT_INVENTORY_QTY = ""
 DEFAULT_INVENTORY_POLICY = "continue"
 DEFAULT_FULFILLMENT_SERVICE = "manual"
 DEFAULT_REQUIRES_SHIPPING = True
@@ -23,9 +23,10 @@ SHOPIFY_BASE_COLS = [
     "Image Src","Image Position","Status",
 ]
 
-# ---- New: options to ALWAYS drop from Etsy variants (case-insensitive) ----
+# ---- Always drop these options (case-insensitive) ----
 EXCLUDE_OPTIONS = {"digital download"}
 
+# ---------------- Helpers ----------------
 def slugify(text: str) -> str:
     text = str(text or "").strip().lower()
     text = re.sub(r"[^\w\s-]", "", text)
@@ -40,13 +41,11 @@ def split_list_field(val):
     return parts
 
 def parse_price(value):
-    """Parse price that may contain currency symbols or thousand separators."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return np.nan
     s = str(value).strip()
     if s == "":
         return np.nan
-    # extract first numeric token
     m = re.search(r"[+-]?[0-9][0-9\.,]*", s)
     if not m:
         try:
@@ -54,9 +53,7 @@ def parse_price(value):
         except Exception:
             return np.nan
     token = m.group(0)
-    # heuristic: if token has both '.' and ',', assume '.' is thousand sep if comma appears last
     if ',' in token and '.' in token:
-        # remove thousand sep
         if token.rfind(',') > token.rfind('.'):
             token = token.replace('.', '').replace(',', '.')
         else:
@@ -88,15 +85,19 @@ def _finalize(df_rows: list[dict]) -> pd.DataFrame:
             df[k] = ""
     return df[ordered]
 
-# ---------- Etsy converter (UPDATED: drop Digital Download + align SKUs) ----------
+# ---------- Etsy converter (SKU applies to Variation 1 only) ----------
 def convert_etsy_to_shopify(file_like, vendor_text: str = "", markup_pct: float = 0.0) -> pd.DataFrame:
     etsy = pd.read_csv(file_like, engine="python")
     rows = []
 
+    def to_list(val):
+        if pd.isna(val): return []
+        return [str(x).strip() for x in str(val).split(",") if str(x).strip()]
+
     for idx, r in etsy.iterrows():
         title = r.get("TITLE", "")
         desc = r.get("DESCRIPTION", "")
-        price = r.get("PRICE", np.nan)
+        price = r.get("PRICE", "")
 
         # Collect up to 20 image URLs if available
         images = []
@@ -108,52 +109,36 @@ def convert_etsy_to_shopify(file_like, vendor_text: str = "", markup_pct: float 
                     images.append(str(v).strip())
 
         # Read options & SKU list
-        opt1_name_raw = r.get("VARIATION 1 NAME", np.nan)
-        opt1_values_all = split_list_field(r.get("VARIATION 1 VALUES", np.nan))
-        opt2_name_raw = r.get("VARIATION 2 NAME", np.nan)
-        opt2_values_all = split_list_field(r.get("VARIATION 2 VALUES", np.nan))
-        sku_list_all   = split_list_field(r.get("SKU", np.nan))
+        opt1_name_raw = r.get("VARIATION 1 NAME") or r.get("VARIATION 1 TYPE")
+        opt2_name_raw = r.get("VARIATION 2 NAME") or r.get("VARIATION 2 TYPE")
+        opt1_all  = to_list(r.get("VARIATION 1 VALUES"))
+        opt2_all  = to_list(r.get("VARIATION 2 VALUES"))
+        sku_list_all = to_list(r.get("SKU"))
 
         # Normalize option names
-        opt1_name_val = str(opt1_name_raw) if pd.notna(opt1_name_raw) and str(opt1_name_raw).strip() else "Option1"
-        opt2_name_val = str(opt2_name_raw) if pd.notna(opt2_name_raw) and str(opt2_name_raw).strip() else ""
+        opt1_name = str(opt1_name_raw).strip() if opt1_name_raw and str(opt1_name_raw).strip() else "Option1"
+        opt2_name = str(opt2_name_raw).strip() if opt2_name_raw and str(opt2_name_raw).strip() else ""
 
-        # Build original cartesian grid for mask derivation
-        orig_opt1 = opt1_values_all if opt1_values_all else ["Default"]
-        orig_opt2 = opt2_values_all if opt2_values_all else [None]
+        # Filtering EXCLUDE_OPTIONS on both axes
+        def keep1(v): return str(v).strip().lower() not in EXCLUDE_OPTIONS
+        def keep2(v): return str(v).strip().lower() not in EXCLUDE_OPTIONS
 
-        orig_pairs = [(a, b) for a in orig_opt1 for b in orig_opt2]
-        orig_count = len(orig_pairs)
+        kept_opt1 = [v for v in opt1_all if keep1(v)] or ["Default"]
+        kept_opt2 = [v for v in opt2_all if keep2(v)]
+        have_opt2 = len(kept_opt2) > 0
 
-        # Build keep masks by excluding EXCLUDE_OPTIONS (case-insensitive) on each axis
-        def keep_opt1(v): return str(v).strip().lower() not in EXCLUDE_OPTIONS
-        def keep_opt2(v): return (str(v).strip().lower() not in EXCLUDE_OPTIONS) if v is not None else True
-
-        kept_opt1 = [v for v in orig_opt1 if keep_opt1(v)]
-        kept_opt2 = [v for v in orig_opt2 if keep_opt2(v)]
-
-        # If after filtering there are no variants (e.g., only Digital Download), skip the product entirely
-        if len(kept_opt1) == 0 or len(kept_opt2) == 0:
+        if len(kept_opt1) == 0:
             continue
 
-        # New variant grid after filtering
-        new_pairs = [(a, b) for a in kept_opt1 for b in kept_opt2]
-        new_count = len(new_pairs)
-
-        # Map SKU list to original grid order (row-major: opt1 x opt2), then drop those that were excluded
-        skus_from_orig = sku_list_all if len(sku_list_all) == orig_count else None
-        kept_skus = []
-        if skus_from_orig is not None:
-            for (a, b), sku in zip(orig_pairs, skus_from_orig):
-                if keep_opt1(a) and keep_opt2(b):
-                    kept_skus.append(sku)
+        # --- Map SKUs to Option1 only ---
+        keep_mask1 = [keep1(v) for v in opt1_all] if opt1_all else []
+        if len(sku_list_all) == len(opt1_all) and opt1_all:
+            skus_opt1 = [s for s, k in zip(sku_list_all, keep_mask1) if k]
         else:
-            # Fallback: assume SKU list already corresponds to remaining variants in row-major (best effort)
-            kept_skus = sku_list_all[:new_count]
-
-        # Pad SKUs if short; will auto-generate later
-        if len(kept_skus) < new_count:
-            kept_skus += [""] * (new_count - len(kept_skus))
+            skus_opt1 = sku_list_all[:len(kept_opt1)]
+        while len(skus_opt1) < len(kept_opt1):
+            skus_opt1.append("")
+        skus_opt1 = [str(s) if pd.notna(s) else "" for s in skus_opt1]
 
         handle = slugify(title) or f"etsy-{idx+1}"
         vendor = vendor_text or r.get("VENDOR", "") or ""
@@ -173,38 +158,45 @@ def convert_etsy_to_shopify(file_like, vendor_text: str = "", markup_pct: float 
                 "Status": DEFAULT_STATUS,
             }
 
-        # Emit variant rows
-        for i, ((v1, v2), sku_val) in enumerate(zip(new_pairs, kept_skus)):
-            row = base_row()
-            if i == 0:
-                row.update({"Title": title, "Body (HTML)": desc})
-                if images:
-                    row["Image Src"] = images[0]; row["Image Position"] = 1
+        v_index = 0
+        for i, (o1, sku_o1) in enumerate(zip(kept_opt1, skus_opt1)):
+            o1_sku = sku_o1 or f"ETSY-{slugify(title)}-{i+1:02d}"
+            if have_opt2:
+                for o2 in kept_opt2:
+                    row = base_row()
+                    if v_index == 0:
+                        row.update({"Title": title, "Body (HTML)": desc})
+                        if images:
+                            row["Image Src"] = images[0]; row["Image Position"] = 1
+                    row.update({
+                        "Option1 Name": opt1_name,
+                        "Option1 Value": o1,
+                        "Option2 Name": opt2_name,
+                        "Option2 Value": o2,
+                        "Variant SKU": o1_sku,  # repeat Option1 SKU across all Option2
+                        "Variant Price": out_price,
+                    })
+                    rows.append(row); v_index += 1
+            else:
+                row = base_row()
+                if v_index == 0:
+                    row.update({"Title": title, "Body (HTML)": desc})
+                    if images:
+                        row["Image Src"] = images[0]; row["Image Position"] = 1
+                row.update({
+                    "Option1 Name": opt1_name,
+                    "Option1 Value": o1,
+                    "Variant SKU": o1_sku,
+                    "Variant Price": out_price,
+                })
+                rows.append(row); v_index += 1
 
-            row.update({
-                "Option1 Name": opt1_name_val,
-                "Option1 Value": v1,
-                "Variant Price": out_price,
-                "Variant SKU": str(sku_val) if sku_val else "",
-            })
-            if opt2_name_val:
-                row["Option2 Name"] = opt2_name_val
-                row["Option2 Value"] = "" if v2 is None else v2
-
-            # Auto-generate SKU if missing
-            if not row["Variant SKU"]:
-                # create a stable index like 01, 02...
-                row["Variant SKU"] = f"ETSY-{slugify(title)}-{i+1:02d}"
-
-            rows.append(row)
-
-        # Emit remaining images as separate rows with only handle + image
         for pos, url in enumerate(images[1:], start=2):
             rows.append({"Handle": handle, "Image Src": url, "Image Position": pos})
 
     return _finalize(rows)
 
-# ---------- TikTok converter (kept as-is from user's previous version) ----------
+# ---------- TikTok converter (kept) ----------
 def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: float = 0.0) -> pd.DataFrame:
     name = getattr(file_like, 'name', '')
     if name and name.lower().endswith('.csv'):
@@ -225,7 +217,6 @@ def convert_tiktok_to_shopify(file_like, vendor_text: str = "", markup_pct: floa
 
     price_col = pick("Price", "Sale Price", "Selling Price", "SKU Price", "Unit Price")
     if price_col is None:
-        # fallback: first column that contains 'price' (case-insensitive)
         for c in tt.columns:
             if "price" in c.lower():
                 price_col = c
